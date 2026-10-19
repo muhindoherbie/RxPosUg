@@ -1,0 +1,25 @@
+name: Worker regression
+
+on:
+  pull_request:
+  push:
+    branches: [main, fix/request-scoped-turso-client]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  request-lifecycle:
+    name: Request lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check Worker syntax
+        run: node --check worker/index.js
+      - name: Test sequential and concurrent database requests
+        run: node --experimental-vm-modules --test tests/worker-request-lifecycle.test.mjs
