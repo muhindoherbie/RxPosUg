@@ -24,12 +24,12 @@ import { backup, restore } from './backup.js';
 
 // Database: Cloudflare D1 (binding DB) by default, or libSQL / Turso when DB_BACKEND = "turso"
 // (secrets TURSO_URL + TURSO_AUTH_TOKEN). The rest of the code doesn't know the difference.
-let turso = null;
 function tursoDb(env) {
   if (env.TURSO_TEST_DB) return env.TURSO_TEST_DB; // tests: a local libSQL file instead of Turso
   if (!env.TURSO_URL) throw httpError(503, 'TURSO_URL is not set');
-  if (!turso || turso.url !== env.TURSO_URL) turso = { url: env.TURSO_URL, db: d1FromLibsql(createClient({ url: env.TURSO_URL, authToken: env.TURSO_AUTH_TOKEN })) };
-  return turso.db;
+  // Workers I/O belongs to the current request; never share the client's pending
+  // work between invocations (an ended request can leave other requests hung).
+  return d1FromLibsql(createClient({ url: env.TURSO_URL, authToken: env.TURSO_AUTH_TOKEN }));
 }
 const withDatabase = (env) => ({ ...env, D1: env.DB, DB: env.DB_BACKEND === 'turso' ? tursoDb(env) : env.DB });
 
