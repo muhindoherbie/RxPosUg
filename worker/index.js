@@ -33,7 +33,8 @@ function tursoDb(env) {
 }
 const withDatabase = (env) => ({ ...env, D1: env.DB, DB: env.DB_BACKEND === 'turso' ? tursoDb(env) : env.DB });
 
-const PAGE = 2500;
+// Keep libSQL response decoding below the Workers Free CPU budget.
+const PAGE = 100;
 const MAX_PUSH = 500;
 const TOKEN_DAYS = 30;
 const MAIN = 'main';
@@ -63,13 +64,15 @@ async function adminChangeRefused(db, tenant, ch) {
   return old?.role !== 'admin';
 }
 
-const schemaReady = new WeakMap();
+// Cache completed metadata only, never an invocation-owned in-flight promise.
+const schemaReady = new Set();
 /**
  * Create whatever tables/indexes are missing. It only reads when everything exists, so it costs no D1 writes
  * (the free plan allows 100,000 row writes a day, and every index multiplies the cost of each record write).
  */
-function ensureSchema(db) {
-  if (!schemaReady.has(db)) schemaReady.set(db, (async () => {
+async function ensureSchema(db, schemaKey = db) {
+  if (schemaReady.has(schemaKey)) return;
+  await (async () => {
     const { results } = await db.prepare("SELECT name, sql FROM sqlite_master WHERE type IN ('table', 'index')").all();
     const have = new Map(results.map((r) => [r.name, r.sql || '']));
     const ddl = [];
@@ -95,8 +98,8 @@ function ensureSchema(db) {
     if (!have.has('reset_codes')) ddl.push('CREATE TABLE reset_codes (k TEXT PRIMARY KEY, code_hash TEXT NOT NULL, expires INTEGER NOT NULL, tries INTEGER NOT NULL DEFAULT 0, sent INTEGER NOT NULL DEFAULT 0, window_start INTEGER NOT NULL DEFAULT 0)');
     // dropping an old index is optional: never let it block the API (e.g. when the daily write limit is reached)
     for (const sql of ddl) await db.prepare(sql).run().catch((e) => { if (!sql.startsWith('DROP')) throw e; });
-  })().catch((e) => { schemaReady.delete(db); throw e; }));
-  return schemaReady.get(db);
+  })();
+  schemaReady.add(schemaKey);
 }
 
 const cors = {
@@ -1026,7 +1029,7 @@ export default {
     if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
     try {
       env = withDatabase(rawEnv);
-      await ensureSchema(env.DB);
+      await ensureSchema(env.DB, env.DB_BACKEND === 'turso' ? env.TURSO_URL : env.DB);
       await ensureMainTenant(env);
       if (path === '/api/health') return json({ ok: true, app: 'rxpos-cloud', configured: (env.SYNC_KEY || '').length >= 12, multiPharmacy: true, version: 5, database: env.DB_BACKEND === 'turso' ? 'turso' : 'd1' });
       // Public: latest WHO Disease Outbreak News (cached 3 h); outbreaks in or near Uganda are flagged
