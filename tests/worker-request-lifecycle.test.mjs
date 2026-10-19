@@ -10,9 +10,10 @@ import { SourceTextModule, SyntheticModule, createContext } from 'node:vm';
 
 const root = new URL('../worker/index.js', import.meta.url);
 
-async function harness() {
+async function harness({ schemaFailures = 0 } = {}) {
   const requests = new AsyncLocalStorage();
   const clients = [];
+  let schemaReads = 0;
   const tables = ['records', 'records_seq', 'records_t', 'records_gseq', 'tenants',
     'tenants_slug', 'login_fail', 'rtc', 'rtc_to', 'file_chunks', 'files',
     'owner_config', 'reset_codes'];
@@ -26,15 +27,25 @@ async function harness() {
     const owner = requests.getStore();
     const client = {
       owner, config, ended: false,
-      async execute({ sql }) {
+      async execute({ sql, args }) {
         // Emulate Workers' invocation-owned network I/O. A shared client must
         // fail even if its previous invocation was still running or has ended.
         assert.equal(requests.getStore(), owner, 'database I/O escaped its request');
         assert.equal(client.ended, false, 'database client reused after request ended');
         await Promise.resolve();
-        if (sql.includes('sqlite_master')) return {
+        if (sql.includes('sqlite_master')) {
+          schemaReads++;
+          if (schemaFailures-- > 0) throw new Error('temporary schema read failure');
+          return {
           columns: ['name', 'sql'], rows: tables.map(n => [n, n === 'tenants' ? 'slug branding' : '']), rowsAffected: 0,
-        };
+          };
+        }
+        if (sql.startsWith('SELECT id FROM tenants WHERE key_hash')) return { columns: ['id'], rows: [['main']] };
+        if (sql.startsWith('SELECT * FROM tenants WHERE id')) return { columns: ['id', 'status'], rows: [['main', 'active']] };
+        if (sql.startsWith('SELECT t, id, rec, deleted, at, seq FROM records')) {
+          assert.ok(args[3] <= 101, 'sync page exceeds CPU-safe record count');
+          return { columns: ['t', 'id', 'rec', 'deleted', 'at', 'seq'], rows: Array.from({ length: args[3] }, (_, i) => ['products', String(i), '{"id":"' + i + '"}', 0, '2026-01-01', i + 1]) };
+        }
         if (sql.includes("t = 'users'") || sql.includes('FROM login_fail')) {
           return { columns: [], rows: [], rowsAffected: 0 };
         }
@@ -72,7 +83,7 @@ async function harness() {
       }
     });
   }
-  return { invoke, clients };
+  return { invoke, clients, schemaReads: () => schemaReads };
 }
 
 test('a completed request cannot poison the next database request', async () => {
@@ -85,6 +96,7 @@ test('a completed request cannot poison the next database request', async () => 
     assert.equal(response.status, 401, await response.clone().text());
   }
   assert.equal(h.clients.length, 3);
+  assert.equal(h.schemaReads(), 1, 'completed schema metadata should be reused without sharing clients');
 });
 
 test('concurrent health, sign-in and authenticated API requests keep separate I/O', async () => {
@@ -112,4 +124,24 @@ test('missing database configuration returns a controlled error', async () => {
   const response = await h.invoke('/api/health', undefined, { TURSO_URL: '' });
   assert.equal(response.status, 503);
   assert.equal((await response.json()).error, 'TURSO_URL is not set');
+});
+
+test('failed schema checks are retried by the next request', async () => {
+  const h = await harness({ schemaFailures: 1 });
+  assert.equal((await h.invoke()).status, 500);
+  assert.equal((await h.invoke()).status, 200);
+  assert.equal(h.schemaReads(), 2);
+});
+
+test('sync paginates remote records within the CPU-safe bound', async () => {
+  const h = await harness();
+  const response = await h.invoke('/api/sync', {
+    method: 'POST', headers: { Authorization: 'Bearer test-only-key', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ deviceId: 'test-device', since: 0, changes: [] }),
+  });
+  assert.equal(response.status, 200, await response.clone().text());
+  const data = await response.json();
+  assert.equal(data.changes.length, 100);
+  assert.equal(data.more, true);
+  assert.equal(data.cursor, 100);
 });
